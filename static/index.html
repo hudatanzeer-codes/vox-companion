@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Ingest Diagnostic</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; background: #121212; color: #fff; }
+    button { padding: 0.8rem 1.5rem; font-size: 1rem; cursor: pointer; border-radius: 6px; border: none; background: #007acc; color: white; }
+    button:hover { background: #005999; }
+    #status { margin-top: 1rem; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <h2>🎙️ Audio Ingest Diagnostic Test</h2>
+  <button id="startBtn" onclick="toggleConnection()">Start Microphone Test</button>
+  <div id="status">Status: Disconnected</div>
+
+  <script>
+    // CRITICAL: Declare audio variables globally so Chrome's Garbage Collector doesn't delete them
+    window.ws = null;
+    window.audioContext = null;
+    window.scriptProcessor = null;
+    window.mediaStream = null;
+    window.micSource = null;
+    window.silentGain = null;
+
+    let isConnected = false;
+
+    async function toggleConnection() {
+      const btn = document.getElementById("startBtn");
+      const status = document.getElementById("status");
+
+      if (!isConnected) {
+        btn.innerText = "Connecting...";
+        await startAudioStream();
+      } else {
+        stopAudioStream();
+        btn.innerText = "Start Microphone Test";
+        status.innerText = "Status: Disconnected";
+        status.style.color = "#ff4d4d";
+        isConnected = false;
+      }
+    }
+
+    async function startAudioStream() {
+      const status = document.getElementById("status");
+
+      try {
+        // 1. Establish WebSocket connection
+        window.ws = new WebSocket("ws://localhost:8765");
+        window.ws.binaryType = "arraybuffer"; // Explicit binary delivery
+
+        window.ws.onopen = async () => {
+          console.log("✅ WebSocket connected to ws://localhost:8765");
+          status.innerText = "Status: Connected & Requesting Mic...";
+          status.style.color = "#00ffcc";
+
+          // 2. Initialize AudioContext
+          window.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          
+          if (window.audioContext.state === "suspended") {
+            await window.audioContext.resume();
+            console.log("🔊 Resumed suspended AudioContext");
+          }
+
+          console.log("🎙️ AudioContext active sample rate:", window.audioContext.sampleRate);
+
+          // 3. Request Mic Stream
+          window.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+
+          console.log("✅ Microphone access granted.");
+
+          // 4. Hook up Web Audio Graph
+          window.micSource = window.audioContext.createMediaStreamSource(window.mediaStream);
+          
+          // Script processor with 4096 buffer size (~256ms of audio)
+          window.scriptProcessor = window.audioContext.createScriptProcessor(4096, 1, 1);
+
+          let frameCounter = 0;
+
+          window.scriptProcessor.onaudioprocess = (event) => {
+            if (!window.ws || window.ws.readyState !== WebSocket.OPEN) return;
+
+            const float32Data = event.inputBuffer.getChannelData(0);
+            
+            // Convert Float32 (-1.0 to 1.0) to Int16 PCM (-32768 to 32767)
+            const pcm16 = new Int16Array(float32Data.length);
+            for (let i = 0; i < float32Data.length; i++) {
+              const s = Math.max(-1, Math.min(1, float32Data[i]));
+              pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            // Send raw PCM ArrayBuffer over WebSocket
+            window.ws.send(pcm16.buffer);
+
+            frameCounter++;
+            if (frameCounter % 10 === 0) {
+              console.log(`📡 Sent ${frameCounter} audio packets to Python backend (${pcm16.buffer.byteLength} bytes each)`);
+            }
+          };
+
+          // Route audio graph to destination with 0 gain to prevent feedback loop while keeping engine active
+          window.silentGain = window.audioContext.createGain();
+          window.silentGain.gain.value = 0;
+
+          window.micSource.connect(window.scriptProcessor);
+          window.scriptProcessor.connect(window.silentGain);
+          window.silentGain.connect(window.audioContext.destination);
+
+          document.getElementById("startBtn").innerText = "Stop Microphone Test";
+          status.innerText = "Status: 🎙️ Streaming Audio Live!";
+          status.style.color = "#00ff00";
+          isConnected = true;
+        };
+
+        window.ws.onerror = (err) => {
+          console.error("❌ WebSocket Error:", err);
+          status.innerText = "Status: Connection Error (Check terminal!)";
+          status.style.color = "#ff4d4d";
+        };
+
+        window.ws.onclose = () => {
+          console.warn("🔌 WebSocket disconnected.");
+        };
+
+      } catch (err) {
+        console.error("❌ Mic Setup Error:", err);
+        status.innerText = `Error: ${err.message}`;
+        status.style.color = "#ff4d4d";
+      }
+    }
+
+    function stopAudioStream() {
+      if (window.scriptProcessor) window.scriptProcessor.disconnect();
+      if (window.micSource) window.micSource.disconnect();
+      if (window.mediaStream) window.mediaStream.getTracks().forEach(t => t.stop());
+      if (window.audioContext) window.audioContext.close();
+      if (window.ws) window.ws.close();
+    }
+  </script>
+</body>
+</html>
